@@ -1,111 +1,164 @@
-# Multi-Container Runtime
+# OS-Jackfruit: Supervised Multi-Container Runtime
 
-A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
+## Team Information
 
-Read [`project-guide.md`](project-guide.md) for the full project specification.
+| Name | SRN |
+|------|-----|
+| Shreya S | PES1UG24CS623 |
+| Vaishnavi H Shetty | PES1UG24CS641 |
 
 ---
 
-## Getting Started
+## Project Overview
 
-### 1. Fork the Repository
+OS-Jackfruit is a lightweight Linux container runtime built in C, inspired by Docker. It consists of two components:
+- **User-space engine** (`engine.c`): A supervisor process that manages multiple isolated containers using Linux namespaces, a CLI for control, and a bounded-buffer logging pipeline.
+- **Kernel module** (`monitor.c`): A Linux Kernel Module (LKM) that monitors container memory usage and enforces soft/hard limits via `/dev/container_monitor`.
 
-1. Go to [github.com/shivangjhalani/OS-Jackfruit](https://github.com/shivangjhalani/OS-Jackfruit)
-2. Click **Fork** (top-right)
-3. Clone your fork:
+---
 
-```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
-cd OS-Jackfruit
-```
+## Build Instructions
 
-### 2. Set Up Your VM
-
-You need an **Ubuntu 22.04 or 24.04** VM with **Secure Boot OFF**. WSL will not work.
-
-Install dependencies:
+### Prerequisites
+- Ubuntu 22.04 (not WSL)
+- `build-essential`, `linux-headers-$(uname -r)`
 
 ```bash
-sudo apt update
 sudo apt install -y build-essential linux-headers-$(uname -r)
 ```
 
-### 3. Run the Environment Check
-
-```bash
-cd boilerplate
-chmod +x environment-check.sh
-sudo ./environment-check.sh
-```
-
-Fix any issues reported before moving on.
-
-### 4. Prepare the Root Filesystem
-
-```bash
-mkdir rootfs-base
-wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
-
-# Make one writable copy per container you plan to run
-cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-base ./rootfs-beta
-```
-
-Do not commit `rootfs-base/` or `rootfs-*` directories to your repository.
-
-### 5. Understand the Boilerplate
-
-The `boilerplate/` folder contains starter files:
-
-| File                   | Purpose                                             |
-| ---------------------- | --------------------------------------------------- |
-| `engine.c`             | User-space runtime and supervisor skeleton          |
-| `monitor.c`            | Kernel module skeleton                              |
-| `monitor_ioctl.h`      | Shared ioctl command definitions                    |
-| `Makefile`             | Build targets for both user-space and kernel module |
-| `cpu_hog.c`            | CPU-bound test workload                             |
-| `io_pulse.c`           | I/O-bound test workload                             |
-| `memory_hog.c`         | Memory-consuming test workload                      |
-| `environment-check.sh` | VM environment preflight check                      |
-
-Use these as your starting point. You are free to restructure the repository however you want — the submission requirements are listed in the project guide.
-
-### 6. Build and Verify
+### Build
 
 ```bash
 cd boilerplate
 make
 ```
 
-If this compiles without errors, your environment is ready.
+This builds: `engine`, `monitor.ko`, `cpu_hog`, `memory_hog`, `io_pulse`.
 
-### 7. GitHub Actions Smoke Check
-
-Your fork will inherit a minimal GitHub Actions workflow from this repository.
-
-That workflow only performs CI-safe checks:
-
-- `make -C boilerplate ci`
-- user-space binary compilation (`engine`, `memory_hog`, `cpu_hog`, `io_pulse`)
-- `./boilerplate/engine` with no arguments must print usage and exit with a non-zero status
-
-The CI-safe build command is:
+### Alpine rootfs setup
 
 ```bash
-make -C boilerplate ci
+mkdir rootfs
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs
 ```
-
-This smoke check does not test kernel-module loading, supervisor runtime behavior, or container execution.
 
 ---
 
-## What to Do Next
+## Running the Runtime
 
-Read [`project-guide.md`](project-guide.md) end to end. It contains:
+### Step 1 — Load the kernel module
+```bash
+sudo insmod monitor.ko
+sudo dmesg | tail -5   # verify: "[container_monitor] Module loaded"
+```
 
-- The six implementation tasks (multi-container runtime, CLI, logging, kernel monitor, scheduling experiments, cleanup)
-- The engineering analysis you must write
-- The exact submission requirements, including what your `README.md` must contain (screenshots, analysis, design decisions)
+### Step 2 — Start the supervisor (Terminal 1)
+```bash
+sudo ./engine supervisor ./rootfs
+```
 
-Your fork's `README.md` should be replaced with your own project documentation as described in the submission package section of the project guide. (As in get rid of all the above content and replace with your README.md)
+### Step 3 — Use the CLI (Terminal 2)
+
+```bash
+# Start containers
+sudo ./engine start alpha ./rootfs /bin/sh
+sudo ./engine start beta ./rootfs /bin/sh
+
+# List containers
+sudo ./engine ps
+
+# View logs
+sudo ./engine logs alpha
+
+# Stop a container
+sudo ./engine stop alpha
+```
+
+### Step 4 — Unload the kernel module
+```bash
+sudo rmmod monitor
+sudo dmesg | tail -5   # verify: "[container_monitor] Module unloaded"
+```
+
+---
+
+## Screenshots
+
+1. **Environment preflight check** — `sudo ./environment-check.sh` output showing all [OK]
+2. **Supervisor started** — Terminal 1 showing supervisor ready on UNIX socket
+3. **Single container running** — `sudo ./engine start alpha` + `sudo ./engine ps`
+4. **Multi-container running** — Two containers (alpha + beta) in `ps` output simultaneously
+5. **CLI commands** — stop/ps/logs commands working across containers
+6. **Kernel module loaded** — `dmesg` showing `[container_monitor] Module loaded`
+7. **Container PID registered** — `dmesg` showing `Registering container= pid=XXXX`
+8. **Clean teardown** — `dmesg` showing `[container_monitor] Module unloaded`
+
+---
+
+## Engineering Analysis
+
+### 1. Namespace Isolation
+Each container is created using `clone()` with `CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS` flags. This gives each container its own PID namespace (so it sees itself as PID 1), its own hostname via UTS namespace, and its own mount namespace so filesystem changes don't affect the host. We use `chroot()` into an Alpine Linux rootfs to complete the filesystem isolation.
+
+### 2. IPC Between CLI and Supervisor
+The CLI client and the long-running supervisor communicate via a **UNIX domain socket** at `/tmp/engine.sock`. The supervisor runs an `accept()` loop, reads one command per connection, executes it, writes the response, and closes the connection. This is simpler and more reliable than named pipes for request-response patterns, and supports concurrent clients.
+
+### 3. Bounded-Buffer Logging (Producer-Consumer)
+Each container's stdout/stderr is captured via a `pipe()`. A **producer thread** reads from the pipe and pushes data into a shared ring buffer (capacity: 64 slots, each 4096 bytes). A single **consumer thread** pops entries from the ring buffer and writes them to per-container log files. The ring buffer is protected by a `pthread_mutex_t` with two `pthread_cond_t` variables (`not_empty`, `not_full`) to block producers when full and the consumer when empty. This decouples I/O-heavy log writing from container management.
+
+### 4. Signal Handling
+- `SIGCHLD`: Handled with `SA_RESTART | SA_NOCLDSTOP`. The handler calls `waitpid(-1, WNOHANG)` in a loop to reap all zombie children immediately and update their state in the metadata store.
+- `SIGTERM` / `SIGINT`: Sets a `volatile int supervisor_running = 0` flag, causing the accept loop to exit and triggering orderly shutdown (stop all containers, drain log pipeline, close FDs).
+
+### 5. Kernel Module Memory Enforcement
+The LKM creates `/dev/container_monitor` using `misc_register()`. The supervisor registers container PIDs via `ioctl(MONITOR_REGISTER)`. The module maintains a mutex-protected linked list of monitored PIDs. A kernel timer periodically checks each container's RSS memory usage. If RSS exceeds the **soft limit**, a warning is printed to `dmesg`. If RSS exceeds the **hard limit**, the kernel sends `SIGKILL` to the container process.
+
+---
+
+## Scheduler Experiment Results (Task 5)
+
+### Experiment: CPU-bound workload (`cpu_hog`) under different scheduling priorities
+
+The `cpu_hog` program performs continuous arithmetic operations for 10 seconds. We measured wall-clock time under three different `nice` values on our single-core VirtualBox VM.
+
+| Priority | Nice Value | Real Time | User Time | Sys Time |
+|----------|-----------|-----------|-----------|----------|
+| Normal   | 0         | 9.477s    | 6.375s    | 3.093s   |
+| Low      | +19       | 9.868s    | 9.835s    | 0.023s   |
+| High     | -20       | 10.214s   | 0.004s    | 0.024s   |
+
+### Analysis
+
+On a **single-core VM with no competing processes**, the CFS scheduler shows minimal wall-clock difference between nice values because the CPU hog is the dominant process regardless of priority. The more revealing difference is in **user vs sys time split**:
+
+- At nice 0: significant sys time (3.093s) reflects normal kernel overhead.
+- At nice +19: almost all time is user-space (9.835s user, 0.023s sys), meaning the low-priority process runs uninterrupted when no higher-priority work exists — CFS still gives it full CPU when idle.
+- At nice -20: paradoxically slower wall time because sudo and shell overhead adds latency at process start.
+
+**Conclusion**: CFS priority effects are most visible under **CPU contention** (multiple competing processes). On a lightly loaded single-core VM, CFS efficiently fills idle CPU regardless of nice value. In a multi-process workload, nice -20 processes would receive proportionally more CPU shares (up to 10x more than nice +19), directly reducing their completion time.
+
+---
+
+## Design Decisions
+
+- **UNIX socket over FIFO**: Chosen for IPC because sockets support bidirectional communication in a single connection, making request-response CLI commands cleaner.
+- **Ring buffer over unbounded queue**: Bounded capacity (64 slots) prevents memory exhaustion if containers produce logs faster than the consumer can write them.
+- **`clone()` over `fork()+unshare()`**: `clone()` allows atomically creating the child in new namespaces, avoiding a race window between fork and namespace setup.
+- **`misc_register()` for kernel device**: Simpler than manually allocating a major number; automatically creates `/dev/container_monitor` via udev.
+
+---
+
+## Cleanup
+
+```bash
+# Remove compiled binaries
+make clean
+
+# Unload kernel module
+sudo rmmod monitor
+
+# Remove log files
+rm -rf /tmp/jackfruit_logs
+rm -f /tmp/engine.sock
+```
